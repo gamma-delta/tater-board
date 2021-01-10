@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context as AnyhowContext, anyhow, bail};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serenity::{
@@ -73,6 +73,7 @@ impl HandlerWrapper {
 
                     let taters: HandlerButOnlyTaters = serde_json::from_reader(tater_file).ok()?;
                     let config: Config = serde_json::from_reader(config_file).ok()?;
+                    log::info!("Loaded taters and config for guild {}", id);
                     Some((
                         GuildId(id),
                         Handler {
@@ -102,7 +103,7 @@ impl HandlerWrapper {
         handlers: &HashMap<GuildId, Handler>,
     ) -> Result<(), anyhow::Error> {
         for (&id, _) in handlers.iter() {
-            HandlerWrapper::save_server_taters(&path, &handlers, id).await?
+            HandlerWrapper::save_server_taters(&path, &handlers, id).await?;
         }
 
         Ok(())
@@ -126,6 +127,7 @@ impl HandlerWrapper {
             taters_got: &handler.taters_got,
         };
         serde_json::to_writer(file, &hbot)?;
+        log::debug!("Saved taters for guild {:?}", guild);
         Ok(())
     }
 
@@ -151,6 +153,7 @@ impl HandlerWrapper {
             .ok_or_else(|| anyhow!("Guild id {} didn't exist somehow", guild.0))?;
         let file = File::create(path.as_ref().join(format!("{}_config.json", guild)))?;
         serde_json::to_writer(file, &handler.config)?;
+        log::debug!("Saved config for guild {:?}", guild);
         Ok(())
     }
 
@@ -217,7 +220,7 @@ impl Handler {
 #[async_trait]
 impl EventHandler for HandlerWrapper {
     async fn ready(&self, _: Context, ready: Ready) {
-        println!(
+        log::info!(
             "{}#{} is connected!",
             ready.user.name, ready.user.discriminator
         );
@@ -245,9 +248,10 @@ impl EventHandler for HandlerWrapper {
             return;
         }
 
-        let res: Result<(), SerenityError> = try {
+        log::trace!("tater added by {:?} to message {:?}", reaction.user_id, reaction.message_id);
+        let res: Result<(), anyhow::Error> = try {
             // ok this is a tater!
-            let giver = reaction.user(&ctx.http).await?;
+            let giver = reaction.user(&ctx.http).await.context("Getting user for reaction")?;
 
             // Update taters received and taters on this message via the cache
             let tatered_message = {
@@ -256,7 +260,7 @@ impl EventHandler for HandlerWrapper {
                     hash_map::Entry::Occupied(o) => o.into_mut(),
                     hash_map::Entry::Vacant(v) => {
                         // this is empty, so we need to fill the cache
-                        let message = reaction.message(&ctx.http).await?;
+                        let message = reaction.message(&ctx.http).await.with_context(|| "Getting message for reaction")?;
                         if message.author.id == self.bot_uid().await {
                             return;
                         }
@@ -278,13 +282,13 @@ impl EventHandler for HandlerWrapper {
             // this person got one more potato
             *this.taters_got.entry(tatered_message.sender).or_insert(0) += 1;
 
-            let new_pin_id = update_pin_message(this, &tatered_message, &reaction, &ctx).await?;
+            let new_pin_id = update_pin_message(this, &tatered_message, &reaction, &ctx).await.context("Update pin message")?;
             if let Some(tm) = this.tatered_messages.get_mut(&reaction.message_id) {
                 tm.pin_id = new_pin_id
             }
         };
         if let Err(oh_no) = res {
-            eprintln!("`reaction_add`: {}", oh_no);
+            log::error!("`reaction_add`: {:?}", oh_no);
         }
     }
 
@@ -296,7 +300,7 @@ impl EventHandler for HandlerWrapper {
         let mut handlers = self.handlers.lock().await;
         let this = handlers.entry(guild_id).or_insert_with(Handler::new);
 
-        let res: Result<(), SerenityError> = try {
+        let res: Result<(), anyhow::Error> = try {
             if this.config.tater_emoji != reaction.emoji {
                 return;
             }
@@ -309,6 +313,7 @@ impl EventHandler for HandlerWrapper {
             }
             // ok this is a tater!
             let ungiver = reaction.user(&ctx.http).await?;
+            log::trace!("tater removed by {:?} from message {:?}", reaction.user_id, reaction.message_id);
 
             // Update taters received and taters on this message via the cache
             let tatered_message = {
@@ -317,7 +322,7 @@ impl EventHandler for HandlerWrapper {
                     hash_map::Entry::Occupied(o) => o.into_mut(),
                     hash_map::Entry::Vacant(..) => {
                         // this should never be an empty entry
-                        eprintln!("`reaction_remove`: there was an empty entry in `tatered_messages`. This probably means someone un-reacted to a message this bot did not know about, from before the bot was introduced.");
+                        log::error!("`reaction_remove`: there was an empty entry in `tatered_messages`. This probably means someone un-reacted to a message this bot did not know about, from before the bot was introduced.");
                         return;
                     }
                 };
@@ -336,26 +341,31 @@ impl EventHandler for HandlerWrapper {
             // this person lost a potato
             *this.taters_got.entry(tatered_message.sender).or_insert(0) -= 1;
 
-            let new_pin_id = update_pin_message(this, &tatered_message, &reaction, &ctx).await?;
+            let new_pin_id = update_pin_message(this, &tatered_message, &reaction, &ctx).await.context("update_pin_message")?;
             if let Some(tm) = this.tatered_messages.get_mut(&reaction.message_id) {
                 tm.pin_id = new_pin_id
             }
         };
         if let Err(oh_no) = res {
-            eprintln!("`reaction_remove`: {}", oh_no);
+            log::error!("`reaction_remove`: {:?}", oh_no);
         }
     }
 
     async fn message(&self, ctx: Context, message: Message) {
+        if message.author.bot {
+            return;
+        }
+
         // Try every time it sees a message.
         // I figure that's often enough
         if let Err(oh_no) = self.check_updates(&ctx).await {
-            eprintln!("`message`: {}", oh_no);
+            log::error!("`message`: {:?}", oh_no);
         }
 
-        let res = commands::handle_commands(self, &ctx, &message).await;
+        let uid = self.bot_uid().await;
+        let res = commands::handle_commands(self, &ctx, uid, &message).await;
         if let Err(oh_no) = res {
-            eprintln!("`message`: {}", oh_no);
+            log::error!("`message`: {:?}", oh_no);
         }
     }
 }
@@ -366,7 +376,7 @@ async fn update_pin_message(
     tatered_message: &TateredMessage,
     reaction: &Reaction,
     ctx: &Context,
-) -> Result<Option<MessageId>, SerenityError> {
+) -> Result<Option<MessageId>, anyhow::Error> {
     let medal_idx = (tatered_message.count as f32 / this.config.threshold as f32)
         .log2()
         .floor();
@@ -384,7 +394,7 @@ async fn update_pin_message(
                 .http
                 .get_message(this.config.pin_channel.0, mid.0)
                 .await?;
-            msg.delete(&ctx.http).await?;
+            msg.delete(&ctx.http).await.context("deleting pin")?;
         }
         return Ok(None);
     };
@@ -393,16 +403,18 @@ async fn update_pin_message(
 
     match tatered_message.pin_id {
         Some(mid) => {
+            log::trace!("Editing existing pin message {}", mid);
             // we just need to edit the header
             let mut msg = ctx
                 .http
                 .get_message(this.config.pin_channel.0, mid.0)
-                .await?;
-            msg.edit(&ctx.http, |m| m.content(content)).await?;
+                .await.with_context(|| format!("getting message {} from channel {}", mid.0, this.config.pin_channel.0))?;
+            msg.edit(&ctx.http, |m| m.content(content)).await.context("updating pin text")?;
             // Don't change anything
             Ok(tatered_message.pin_id)
         }
         None => {
+            log::trace!("Creating new pin message");
             // Must both create and edit message
             let original_message = reaction.message(&ctx.http).await?;
             let content_safe = original_message.content_safe(&ctx.cache).await;
